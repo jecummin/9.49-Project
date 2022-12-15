@@ -81,18 +81,17 @@ def generate_image_objects(
         "8": 0,
         "9": 0}
 
-    objectWidth = 6
-    objectHeight = 6
+    dims = int(input_data.shape[-1]/objectWidth/objectWidth)
     for sample_iter in range(len(label_samples)):
 
         # sample_temp = np.reshape(input_data_samples[sample_iter],
         #                          (128, objectWidth, objectWidth))
         sample_temp = np.reshape(input_data_samples[sample_iter],
-                                 (128, objectWidth, objectHeight))
+                                 (dims, objectWidth, objectWidth))
         sample_features_list = []
 
         for width_iter in range(objectWidth):
-            for height_iter in range(objectHeight):
+            for height_iter in range(objectWidth):
 
                 # Convert the SDRs into sparse arrays (i.e. just representing the
                 # non-zero elements)

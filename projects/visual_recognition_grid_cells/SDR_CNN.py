@@ -36,8 +36,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
+from tqdm import tqdm
 
 from nupic.torch.modules import KWinners2d, rezero_weights, update_boost_strength
+from bit import *
 
 seed_val = 1
 torch.manual_seed(seed_val)
@@ -45,26 +47,45 @@ np.random.seed(seed_val)
 
 # Parameters
 TRAIN_NEW_NET = True  # To generate all the SDRs needed for down-stream use in other
+TRAIN_NEW_NET = False
 # programs, train a network and run this again with TRAIN_NEW_NET=False
 
 # k-WTA parameters
 PERCENT_ON = 0.15  # Recommend 0.15
 BOOST_STRENGTH = 20.0  # Recommend 20
 
-# DATASET = "mnist"  # Options are "mnist" or "fashion_mnist"; note in some cases
+DATASET = "mnist"  # Options are "mnist" or "fashion_mnist"; note in some cases
 DATASET = "cifar"
+SCALE = True
 # fashion-MNIST may not have full functionality (e.g. normalization, subsequent use of
 # SDRs by downstream classifiers)
+
+MODEL = "BaseCNN"
+GRID_SIZE = 6
+MODEL = "BiT"
+OUT_DIM = 128
+GRID_SIZE = 5
+BLOCK_UNITS = [3, 4, 6, 3]
+PRETRAINED = False
+PRETRAINED = True
+OUT_DIM = 256
+FULL = False
+FULL = True
+OUT_DIM = 2048
+WEIGHTS = "R50x1_160.npz"
 
 LEARNING_RATE = 0.01  # Recommend 0.01
 MOMENTUM = 0.5  # Recommend 0.5
 EPOCHS = 10  # Recommend 10
 FIRST_EPOCH_BATCH_SIZE = 4  # Used for optimizing k-WTA
-TRAIN_BATCH_SIZE = 128  # Recommend 128
+#FIRST_EPOCH_BATCH_SIZE = 1024
+TRAIN_BATCH_SIZE = 1024  # Recommend 128
 TEST_BATCH_SIZE = 1000
+#TEST_BATCH_SIZE = 1024
 
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device: " + str(device))
+print("Using model: "+MODEL)
 
 
 def train(model, loader, optimizer, criterion, post_batch_callback=None):
@@ -83,7 +104,7 @@ def train(model, loader, optimizer, criterion, post_batch_callback=None):
     :type post_batch_callback: function
     """
     model.train()
-    for _batch_idx, (data, target) in enumerate(loader):
+    for _batch_idx, (data, target) in tqdm(enumerate(loader),total=len(loader)):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
@@ -111,21 +132,24 @@ def test(model, loader, test_size, criterion, epoch, sdr_output_subset=None):
     :return: Dict with "accuracy", "loss" and "total_correct"
     """
     model.eval()
+    total = len(loader.dataset)
     loss = 0
     total_correct = 0
 
     # Store data for SDR-based classifiers
-    all_sdrs = []
-    all_labels = []
+    if sdr_output_subset is not None:
+        all_sdrs = []
+        all_labels = []
 
     with torch.no_grad():
-        for data, target in loader:
+        for data, target in tqdm(loader,total=len(loader)):
 
             data, target = data.to(device), target.to(device)
             output = model(data)
 
-            all_sdrs.append(np.array(model.output_sdr(data).cpu()))
-            all_labels.append(target)
+            if sdr_output_subset is not None:
+                all_sdrs.append(np.array(model.output_sdr(data).cpu()))
+                all_labels.append(target)
 
             loss += criterion(output, target, reduction="sum").item()  # sum up batch
             # loss
@@ -148,18 +172,18 @@ def test(model, loader, test_size, criterion, epoch, sdr_output_subset=None):
                 + str(epoch) + ".png")
     plt.clf()
 
-    #print('sdrs', type(all_sdrs[0]))
-    try:
-        all_sdrs = np.concatenate([a.cpu() for a in all_sdrs], axis=0)
-    except:
-        all_sdrs = np.concatenate(all_sdrs, axis=0)
-    #print('labels', type(all_labels[0]))
-    try:
-        all_labels = np.concatenate([a.cpu() for a in all_labels], axis=0)
-    except:
-        all_labels = np.concatenate(all_labels, axis=0)
-
     if sdr_output_subset is not None:
+        #print('sdrs', type(all_sdrs[0]))
+        try:
+            all_sdrs = np.concatenate([a.cpu() for a in all_sdrs], axis=0)
+        except:
+            all_sdrs = np.concatenate(all_sdrs, axis=0)
+        #print('labels', type(all_labels[0]))
+        try:
+            all_labels = np.concatenate([a.cpu() for a in all_labels], axis=0)
+        except:
+            all_labels = np.concatenate(all_labels, axis=0)
+
         print("Saving generated SDR and label outputs from data sub-section: "
               + sdr_output_subset)
         np.save("python2_htm_docker/docker_dir/training_and_testing_data/" + DATASET
@@ -246,6 +270,86 @@ class SDRCNNBase(nn.Module):
         return x
 
 
+class SDRBiT(nn.Module):
+    """
+    BiT Classifier that uses k-WTA to create a sparse representation after the
+    second pooling operation.
+    This sparse operation can subsequently be binarized and output so as to
+    generate SDR-like representaitons given an input image.
+    """
+    def __init__(self, in_channels, percent_on, boost_strength):
+        super(SDRBiT, self).__init__()
+        self.root = nn.Sequential(OrderedDict([
+            ('conv', StdConv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)),
+            ('pad', nn.ConstantPad2d(1, 0)),
+            ('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=0)),
+        ]))
+        self.body = nn.Sequential(OrderedDict([
+            ('block1', nn.Sequential(OrderedDict(
+                [('unit01', PreActBottleneck(cin=64, cout=OUT_DIM, cmid=64))] +
+                [(f'unit{i:02d}', PreActBottleneck(cin=OUT_DIM, cout=OUT_DIM, cmid=64)) for i in range(2, BLOCK_UNITS[0] + 1)],
+            ))),
+        ] if not FULL else [
+            ('block1', nn.Sequential(OrderedDict(
+                [('unit01', PreActBottleneck(cin=64, cout=256, cmid=64))] +
+                [(f'unit{i:02d}', PreActBottleneck(cin=256, cout=256, cmid=64)) for i in range(2, BLOCK_UNITS[0] + 1)],
+            ))),
+            ('block2', nn.Sequential(OrderedDict(
+                [('unit01', PreActBottleneck(cin=256, cout=512, cmid=128, stride=2))] +
+                [(f'unit{i:02d}', PreActBottleneck(cin=512, cout=512, cmid=128)) for i in range(2, BLOCK_UNITS[1] + 1)],
+            ))),
+            ('block3', nn.Sequential(OrderedDict(
+                [('unit01', PreActBottleneck(cin=512, cout=1024, cmid=256, stride=2))] +
+                [(f'unit{i:02d}', PreActBottleneck(cin=1024, cout=1024, cmid=256)) for i in range(2, BLOCK_UNITS[2] + 1)],
+            ))),
+            ('block4', nn.Sequential(OrderedDict(
+                [('unit01', PreActBottleneck(cin=1024, cout=2048, cmid=512, stride=2))] +
+                [(f'unit{i:02d}', PreActBottleneck(cin=2048, cout=2048, cmid=512)) for i in range(2, BLOCK_UNITS[3] + 1)],
+            ))),
+        ]))
+
+        self.shape = GRID_SIZE
+        self.downsample = nn.AdaptiveAvgPool2d(self.shape)
+        self.k_winner = KWinners2d(channels=OUT_DIM, percent_on=percent_on,
+                                   boost_strength=boost_strength, local=True)
+        self.dense1 = nn.Linear(in_features=OUT_DIM * self.shape * self.shape, out_features=256)
+        self.dense2 = nn.Linear(in_features=256, out_features=128)
+        self.output = nn.Linear(in_features=128, out_features=10)
+        self.softmax = nn.LogSoftmax(dim=1)
+    
+    def load_from(self, weights, prefix='resnet/'):
+        with torch.no_grad():
+            self.root.conv.weight.copy_(tf2th(weights[f'{prefix}root_block/standardized_conv2d/kernel']))
+            for bname, block in self.body.named_children():
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, prefix=f'{prefix}{bname}/{uname}/')
+
+    def until_kwta(self, inputs):
+        x = self.root(inputs)
+        x = self.body(x)
+        x = self.downsample(x)
+        x = self.k_winner(x)
+        x = x.view(-1, OUT_DIM * self.shape * self.shape)
+
+        return x
+
+    def forward(self, inputs):
+        x = self.until_kwta(inputs)
+        x = F.relu(self.dense1(x))
+        x = F.relu(self.dense2(x))
+        x = self.softmax(self.output(x))
+
+        return x
+
+    def output_sdr(self, inputs):
+        """Returns a binarized SDR-like output from the CNN"s
+        mid-level representations"""
+        x = self.until_kwta(inputs)
+        x = (x > 0).float()
+
+        return x
+
+
 def data_setup():
     """
     Note there are three data-sets used in all of the experiments; the training
@@ -263,13 +367,34 @@ def data_setup():
 
     if DATASET == "mnist":
         print("Using MNIST data-set")
-        normalize = transforms.Compose([transforms.ToTensor(),
-                                       transforms.Normalize((0.1307,), (0.3081,))])
-        train_dataset = datasets.MNIST("data", train=True, download=True,
-                                       transform=normalize)
-        test_dataset = datasets.MNIST("data", train=False,
-                                      download=True,
-                                      transform=normalize)
+        train_dataset = datasets.MNIST(
+            "data",
+            train=True,
+            download=True,
+            transform=transforms.Compose(
+                ([] if not SCALE else [transforms.Resize((160, 160)),
+                                           transforms.RandomCrop((128, 128)),
+                                           transforms.RandomHorizontalFlip(),]) +
+                [transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,))] +
+                ([] if not PRETRAINED else [transforms.Lambda(
+                    lambda x: x.repeat(3,1,1)
+                )])
+            )
+        )
+        test_dataset = datasets.MNIST(
+            "data",
+            train=False,
+            download=True,
+            transform=transforms.Compose(
+                ([] if not SCALE else [transforms.Resize((128, 128)),]) +
+                [transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,))] +
+                ([] if not PRETRAINED else [transforms.Lambda(
+                    lambda x: x.repeat(3,1,1)
+                )])
+            )
+        )
 
     elif DATASET == "fashion_mnist":
         print("Using Fashion-MNIST data-set")
@@ -282,14 +407,30 @@ def data_setup():
 
     elif DATASET == "cifar":
         print("Using CIFAR10 data-set")
-        normalize = transforms.Compose([transforms.ToTensor(),
-                                       transforms.Normalize((0.4914, 0.4822, 0.4465),
-                                                            (0.247, 0.243, 0.261))])
-        train_dataset = datasets.CIFAR10("data", train=True, download=True,
-                                       transform=normalize)
-        test_dataset = datasets.CIFAR10("data", train=False,
-                                      download=True,
-                                      transform=normalize)
+        
+        train_dataset = datasets.CIFAR10(
+            "data",
+            train=True,
+            download=True,
+            transform=transforms.Compose(
+                ([] if not SCALE else [transforms.Resize((160, 160)),
+                                           transforms.RandomCrop((128, 128)),
+                                           transforms.RandomHorizontalFlip(),]) +
+                [transforms.ToTensor(),
+                 transforms.Normalize((0.4914, 0.4822, 0.4465),(0.247, 0.243, 0.261))]
+            )
+        )
+
+        test_dataset = datasets.CIFAR10(
+            "data",
+            train=False,
+            download=True,
+            transform=transforms.Compose(
+                ([] if not SCALE else [transforms.Resize((128, 128)),]) +
+                [transforms.ToTensor(),
+                 transforms.Normalize((0.4914, 0.4822, 0.4465),(0.247, 0.243, 0.261))]
+            )
+        )
 
 
     total_traing_len = len(train_dataset)
@@ -325,9 +466,12 @@ if __name__ == "__main__":
     (first_loader, train_loader, test_cnn_loader, test_sdrc_loader, training_len,
         testing_cnn_len, testing_sdr_classifier_len) = data_setup()
 
-    in_channels = 3 if DATASET == 'cifar' else 1
-    sdr_cnn = SDRCNNBase(in_channels=in_channels, percent_on=PERCENT_ON, boost_strength=BOOST_STRENGTH)
-
+    in_channels = 3 if DATASET == 'cifar' or PRETRAINED else 1 
+    cnn = SDRCNNBase if MODEL != "BiT" else SDRBiT
+    sdr_cnn = cnn(in_channels=in_channels, percent_on=PERCENT_ON, boost_strength=BOOST_STRENGTH)
+    if PRETRAINED:
+        print("Loading weights from "+WEIGHTS)
+        sdr_cnn.load_from(np.load(WEIGHTS))
     sdr_cnn.to(device)
 
     if os.path.exists("saved_networks/") is False:
@@ -362,7 +506,7 @@ if __name__ == "__main__":
              epoch="pre_epoch", criterion=F.nll_loss)
 
         print("Performing full training")
-        for epoch in range(1, EPOCHS):
+        for epoch in tqdm(range(1, EPOCHS),total=EPOCHS):
             train(model=sdr_cnn, loader=train_loader, optimizer=sgd,
                   criterion=F.nll_loss, post_batch_callback=post_batch)
             sdr_cnn.apply(update_boost_strength)
@@ -374,7 +518,7 @@ if __name__ == "__main__":
         print("Saving network state...")
         torch.save(sdr_cnn.state_dict(), "saved_networks/sdr_cnn.pt")
 
-    else:
+    elif MODEL != "BiT":
         print("Evaluating a pre-trained model:")
         sdr_cnn.load_state_dict(torch.load("saved_networks/sdr_cnn.pt"))
 

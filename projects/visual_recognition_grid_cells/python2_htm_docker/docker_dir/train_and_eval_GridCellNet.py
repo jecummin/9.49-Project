@@ -56,6 +56,7 @@ CLASS_THRESHOLDS_LIST = [0.3]  # Determines the relative activity threshold that
 INPUT_GRID_DIMENSION = 5  # Options are 4 or 5, depending on the kind of pre-processing
 # of the input used i.e. 7x7 pixel patches on a 4x4 grid, or 5x5 grid extracted from
 # the middle layer of a CNN
+INPUT_FEATURE_DIMENSION = 128
 
 NUM_TEST_OBJECTS_PER_CLASS = 100  # The number of test objects per class to use during
 # evaluation
@@ -439,7 +440,7 @@ if __name__ == "__main__":
                         bumpType="square",  # No significance of using this or vs
                         # e.g. Gaussian bump for this task
                         cellsPerColumn=32,
-                        columnCount=128,  # Total dimension of the input feature
+                        columnCount=INPUT_FEATURE_DIMENSION,  # Total dimension of the input feature
                         # SDRs
                         activeColumnCount=29,  # Number of non-zero values in the
                         # input feature SDRs
